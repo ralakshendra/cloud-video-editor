@@ -10,9 +10,9 @@ Cloud video editing service using Render, Docker, FFmpeg and Gemini Omni Flash.
 4. Applies your editing prompt with Gemini Omni Flash.
 5. Downloads each generated result.
 6. Merges the edited chunks with FFmpeg.
-7. Returns `final_ai_edit.mp4`.
+7. Lets you monitor the job and download the final video when ready.
 
-Gemini Omni's uploaded-video editing limit is 10 seconds, so this uses 10-second chunks rather than the old 30-second split.
+Gemini Omni's uploaded-video editing limit is 10 seconds, so this uses 10-second chunks.
 
 ## Render environment variables
 
@@ -33,16 +33,53 @@ Optional:
 curl https://YOUR-APP.onrender.com/
 ```
 
-## Process a video
+## Start a video job
+
+Use this command from the folder containing your video:
 
 ```cmd
-curl -X POST -F "video=@my_raw_video.mp4" -F "prompt=Apply a cinematic color grade and stabilize the footage. Keep everything else the same." https://YOUR-APP.onrender.com/edit --output final_ai_edit.mp4
+curl -X POST -F "video=@VID_20260927_093207_392_bsl.mp4" -F "prompt=Apply a cinematic color grade and stabilize the footage. Keep everything else the same." https://YOUR-APP.onrender.com/edit
+```
+
+The response is immediate and looks like:
+
+```json
+{
+  "job_id": "abc123...",
+  "status": "queued",
+  "status_url": "/status/abc123...",
+  "download_url": "/download/abc123..."
+}
+```
+
+## Check job status
+
+Replace `JOB_ID` with the returned ID:
+
+```cmd
+curl https://YOUR-APP.onrender.com/status/JOB_ID
+```
+
+The response includes:
+
+- `status`: queued, processing, completed, or failed
+- `phase`: current processing stage
+- `current_chunk` and `total_chunks`
+- `completed_chunks`
+- `gemini_file_state`: the current Gemini Files API state
+- `gemini_file`: the Gemini file URI when available
+- `error`: details if the job fails
+
+## Download the finished video
+
+After status reports `"status": "completed"`:
+
+```cmd
+curl https://YOUR-APP.onrender.com/download/JOB_ID --output final_ai_edit.mp4
 ```
 
 ## Important
 
-Each 10-second chunk is independently edited. That means cuts can occur at chunk boundaries and Gemini may make slightly different decisions between chunks.
+Each 10-second chunk is independently edited. Gemini may make slightly different decisions between chunks.
 
-The Render filesystem is temporary. The service is designed to return the final file immediately rather than use Render as permanent storage.
-
-For longer jobs, an asynchronous queue/job endpoint is the next production improvement.
+The Render filesystem is temporary, and the job tracker is in memory. If Render restarts while a job is running, the job and temporary files can be lost.
