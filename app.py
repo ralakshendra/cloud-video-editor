@@ -1,10 +1,10 @@
-import base64
 import os
 import shutil
 import subprocess
-import tempfile
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_file
@@ -18,6 +18,24 @@ CHUNK_SECONDS = int(os.environ.get("CHUNK_SECONDS", "10"))
 OUTPUT_RESOLUTION = os.environ.get("OUTPUT_RESOLUTION", "1080p")
 WORK_ROOT = Path("/tmp/video_jobs")
 WORK_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Render can restart a free instance, so this is intentionally an in-memory job
+# tracker for the current running instance. It makes long Gemini jobs observable
+# without keeping the client's HTTP request open.
+jobs = {}
+jobs_lock = threading.Lock()
+executor = ThreadPoolExecutor(max_workers=1)
+
+
+def update_job(job_id, **updates):
+    with jobs_lock:
+        jobs.setdefault(job_id, {}).update(updates)
+
+
+def get_job(job_id):
+    with jobs_lock:
+        job = jobs.get(job_id)
+        return dict(job) if job else None
 
 
 def run_command(args):
@@ -33,7 +51,7 @@ def run_command(args):
 
 
 def split_video(input_path: Path, out_dir: Path):
-    """Split into <=10s chunks, which matches Gemini Omni uploaded-video editing limits."""
+    """Split into <=10s chunks, matching Gemini Omni uploaded-video limits."""
     pattern = out_dir / "chunk_%03d.mp4"
 
     run_command([
@@ -67,10 +85,19 @@ def create_client():
     return genai.Client(api_key=api_key)
 
 
-def wait_for_file(client, file_name):
+def file_state_name(video_file):
+    state = getattr(video_file, "state", None)
+    name = getattr(state, "name", None)
+    return name or str(state)
+
+
+def wait_for_file(client, file_name, job_id=None):
     while True:
         video_file = client.files.get(name=file_name)
-        state = getattr(video_file.state, "name", str(video_file.state))
+        state = file_state_name(video_file)
+
+        if job_id:
+            update_job(job_id, gemini_file_state=state, gemini_file=video_file.uri)
 
         if state == "ACTIVE":
             return video_file
@@ -80,11 +107,27 @@ def wait_for_file(client, file_name):
         time.sleep(5)
 
 
-def edit_chunk(client, chunk_path: Path, prompt: str, output_path: Path):
+def edit_chunk(client, chunk_path: Path, prompt: str, output_path: Path, job_id: str, index: int, total: int):
+    update_job(
+        job_id,
+        phase="uploading_to_gemini",
+        current_chunk=index,
+        total_chunks=total,
+        completed_chunks=index - 1,
+        gemini_file_state="UPLOADING",
+    )
+
     print(f"Uploading {chunk_path.name} to Gemini...")
     video_file = client.files.upload(file=str(chunk_path))
 
-    video_file = wait_for_file(client, video_file.name)
+    update_job(
+        job_id,
+        phase="waiting_for_gemini",
+        gemini_file=video_file.uri,
+        gemini_file_state=file_state_name(video_file),
+    )
+
+    video_file = wait_for_file(client, video_file.name, job_id)
     print(f"Gemini input ready: {video_file.uri}")
 
     edit_prompt = (
@@ -94,7 +137,9 @@ def edit_chunk(client, chunk_path: Path, prompt: str, output_path: Path):
         "requires changing them."
     )
 
+    update_job(job_id, phase="editing_with_gemini", gemini_file_state="ACTIVE")
     print(f"Editing {chunk_path.name} with {MODEL_ID}...")
+
     interaction = client.interactions.create(
         model=MODEL_ID,
         input=[
@@ -112,9 +157,14 @@ def edit_chunk(client, chunk_path: Path, prompt: str, output_path: Path):
     if not output_video or not output_video.uri:
         raise RuntimeError("Gemini returned no video URI.")
 
-    # Google-hosted generated video files become ACTIVE before download.
+    update_job(
+        job_id,
+        phase="downloading_gemini_output",
+        gemini_output_uri=output_video.uri,
+    )
+
     generated_name = output_video.uri.split("/")[-1]
-    wait_for_file(client, f"files/{generated_name}")
+    wait_for_file(client, f"files/{generated_name}", job_id)
 
     print(f"Downloading edited {chunk_path.name}...")
     client.files.download(
@@ -133,8 +183,6 @@ def merge_videos(video_paths, output_path: Path):
         for path in video_paths:
             f.write(f"file '{path.as_posix()}'\n")
 
-    # Re-encode the final file so differences between generated chunks do not
-    # prevent concatenation.
     run_command([
         "ffmpeg", "-y",
         "-f", "concat",
@@ -148,6 +196,71 @@ def merge_videos(video_paths, output_path: Path):
         "-movflags", "+faststart",
         str(output_path),
     ])
+
+
+def process_job(job_id, job_dir, prompt):
+    try:
+        input_path = job_dir / "input.mp4"
+        size_mb = input_path.stat().st_size / (1024 * 1024)
+
+        if size_mb > MAX_UPLOAD_MB:
+            raise RuntimeError(f"Video is larger than {MAX_UPLOAD_MB} MB.")
+
+        update_job(job_id, status="processing", phase="splitting_video")
+
+        chunks_dir = job_dir / "chunks"
+        chunks_dir.mkdir()
+        chunks = split_video(input_path, chunks_dir)
+        total = len(chunks)
+
+        update_job(
+            job_id,
+            phase="processing_chunks",
+            total_chunks=total,
+            completed_chunks=0,
+            current_chunk=1,
+        )
+
+        client = create_client()
+        edited_dir = job_dir / "edited"
+        edited_dir.mkdir()
+
+        edited_chunks = []
+        for index, chunk in enumerate(chunks, start=1):
+            edited = edited_dir / f"edited_{index:03d}.mp4"
+            edit_chunk(client, chunk, prompt, edited, job_id, index, total)
+            edited_chunks.append(edited)
+
+            update_job(
+                job_id,
+                completed_chunks=index,
+                current_chunk=index + 1 if index < total else total,
+                phase="processing_chunks" if index < total else "merging_video",
+                gemini_file_state="COMPLETE",
+            )
+
+        final_path = job_dir / "final_ai_edit.mp4"
+        merge_videos(edited_chunks, final_path)
+
+        update_job(
+            job_id,
+            status="completed",
+            phase="completed",
+            completed_chunks=total,
+            current_chunk=total,
+            download_url=f"/download/{job_id}",
+        )
+
+        print(f"Job {job_id} completed.")
+
+    except Exception as exc:
+        print(f"Job {job_id} failed: {exc}")
+        update_job(
+            job_id,
+            status="failed",
+            phase="failed",
+            error=str(exc),
+        )
 
 
 @app.get("/")
@@ -182,50 +295,72 @@ def edit():
     input_path = job_dir / "input.mp4"
     video.save(input_path)
 
-    try:
-        size_mb = input_path.stat().st_size / (1024 * 1024)
-        if size_mb > MAX_UPLOAD_MB:
-            return jsonify({
-                "error": f"Video is larger than {MAX_UPLOAD_MB} MB."
-            }), 413
-
-        print(f"Starting job {job_id}")
-        chunks_dir = job_dir / "chunks"
-        chunks_dir.mkdir()
-
-        chunks = split_video(input_path, chunks_dir)
-        print(f"Created {len(chunks)} chunks.")
-
-        client = create_client()
-        edited_dir = job_dir / "edited"
-        edited_dir.mkdir()
-
-        edited_chunks = []
-        for index, chunk in enumerate(chunks, start=1):
-            edited = edited_dir / f"edited_{index:03d}.mp4"
-            edit_chunk(client, chunk, prompt, edited)
-            edited_chunks.append(edited)
-
-        final_path = job_dir / "final_ai_edit.mp4"
-        merge_videos(edited_chunks, final_path)
-
-        return send_file(
-            final_path,
-            as_attachment=True,
-            download_name="final_ai_edit.mp4",
-            mimetype="video/mp4",
-        )
-
-    except Exception as exc:
-        print(f"Job {job_id} failed: {exc}")
+    size_mb = input_path.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_UPLOAD_MB:
+        shutil.rmtree(job_dir, ignore_errors=True)
         return jsonify({
-            "error": "Video processing failed.",
-            "details": str(exc),
-        }), 500
-    finally:
-        # Keep the downloaded response alive while Flask serves it, then clean up.
-        # Render's filesystem is ephemeral anyway.
-        pass
+            "error": f"Video is larger than {MAX_UPLOAD_MB} MB."
+        }), 413
+
+    update_job(
+        job_id,
+        status="queued",
+        phase="queued",
+        total_chunks=None,
+        completed_chunks=0,
+        current_chunk=None,
+        gemini_file_state=None,
+        download_url=None,
+    )
+
+    executor.submit(process_job, job_id, job_dir, prompt)
+
+    return jsonify({
+        "job_id": job_id,
+        "status": "queued",
+        "status_url": f"/status/{job_id}",
+        "download_url": f"/download/{job_id}",
+        "message": "Upload received. Processing has started in the background.",
+    }), 202
+
+
+@app.get("/status/<job_id>")
+def status(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({
+            "error": "Job not found. Render may have restarted and cleared in-memory jobs."
+        }), 404
+
+    return jsonify({
+        "job_id": job_id,
+        **job,
+    })
+
+
+@app.get("/download/<job_id>")
+def download(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+
+    if job.get("status") != "completed":
+        return jsonify({
+            "error": "Video is not ready yet.",
+            "status": job.get("status"),
+            "phase": job.get("phase"),
+        }), 409
+
+    final_path = WORK_ROOT / job_id / "final_ai_edit.mp4"
+    if not final_path.exists():
+        return jsonify({"error": "Final video file is no longer available."}), 404
+
+    return send_file(
+        final_path,
+        as_attachment=True,
+        download_name="final_ai_edit.mp4",
+        mimetype="video/mp4",
+    )
 
 
 if __name__ == "__main__":
