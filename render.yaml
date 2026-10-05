@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: cloud-video-editor
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: MODEL_ID
+        value: gemini-omni-1.1-flash
+      - key: CHUNK_SECONDS
+        value: "10"
+      - key: OUTPUT_RESOLUTION
+        value: 1080p
+      - key: MAX_UPLOAD_MB
+        value: "500"
